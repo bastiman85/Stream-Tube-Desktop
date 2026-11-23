@@ -735,7 +735,15 @@ impl AppView {
             if watch.load(Ordering::Relaxed) {
                 return;
             }
-            let open = this.update(cx, |t, _| t.web_login.attempt == attempt && matches!(t.dialog, Some(Dialog::WebSignIn))).unwrap_or(false);
+            let open = this
+                .update(cx, |t, cx| {
+                    // the channel step appears once the browser sign-in has finished
+                    if crate::api::web::waiting_for_channel() {
+                        cx.notify();
+                    }
+                    t.web_login.attempt == attempt && matches!(t.dialog, Some(Dialog::WebSignIn))
+                })
+                .unwrap_or(false);
             if !open {
                 watch.store(true, Ordering::Relaxed);
                 return;
@@ -828,12 +836,29 @@ impl AppView {
                                 .child("Videos you watch in Stream Tube then show in your YouTube history, and your phone and TV resume them where you stopped. The window uses its own empty profile, which is deleted afterwards."),
                         ),
                 )
+                .when(crate::api::web::waiting_for_channel(), |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(div().text_sm().text_color(p.text).child(format!(
+                                "Your account has several channels. To save history to another one, switch to it in the {browser} window: profile picture → Switch account. Stream Tube continues by itself."
+                            )))
+                            .child(div().flex().child(pill("wsi-keep", Some("arrow-right"), "Continue without switching", cx).on_click(|_, _, cx| {
+                                crate::api::web::continue_with_current_channel();
+                                cx.refresh_windows();
+                            }))),
+                    )
+                })
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child(div().flex().items_center().gap_2().child(spinner(cx)).child(div().text_xs().text_color(p.text3).child("Waiting for sign-in…")))
+                        .child(div().flex().items_center().gap_2().child(spinner(cx)).child(div().text_xs().text_color(p.text3).child(
+                            if crate::api::web::waiting_for_channel() { "Waiting for the channel switch…" } else { "Waiting for sign-in…" },
+                        )))
                         .child(cancel),
                 )
                 .child(cookies_link);

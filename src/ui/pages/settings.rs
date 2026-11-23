@@ -573,7 +573,7 @@ impl SettingsPage {
             .child({
                 let (desc, ctl) = match crate::api::web::account_name().filter(|_| crate::api::web::connected()) {
                     Some(name) => (
-                        format!("Connected as {name}. Videos you watch here show in your YouTube history and resume where you stopped on your other devices"),
+                        format!("Connected as {name}. Videos you watch here show in your YouTube history and resume where you stopped on your other devices. To use another channel, disconnect and connect again"),
                         pill("web-out", Some("unlink"), "Disconnect", cx).on_click(|_, _, cx| crate::ui::app::disconnect_web(cx)),
                     ),
                     None => (

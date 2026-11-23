@@ -28,6 +28,9 @@ const SIGN_IN_URL: &str = "https://accounts.google.com/ServiceLogin?service=yout
 struct Session {
     cookies: BTreeMap<String, String>,
     account: Option<String>,
+    /// brand account channel to act as (sent as X-Goog-PageId); None = personal channel
+    #[serde(default)]
+    page_id: Option<String>,
 }
 
 fn session() -> &'static Mutex<Option<Session>> {
@@ -64,12 +67,18 @@ pub fn disconnect() {
 
 /// Stores a set of youtube.com cookies and checks they belong to a signed-in account.
 fn connect(cookies: BTreeMap<String, String>) -> Result<String> {
+    connect_as(cookies, None)
+}
+
+/// Like `connect`, with the brand channel page id when it's known (else it's
+/// looked up from the channel list).
+fn connect_as(cookies: BTreeMap<String, String>, page: Option<String>) -> Result<String> {
     if !has_login(&cookies) {
         return Err(anyhow!("These cookies aren't from a signed-in YouTube session."));
     }
     {
         let mut s = session().lock();
-        *s = Some(Session { cookies, account: None });
+        *s = Some(Session { cookies, account: None, page_id: None });
     }
     let name = match fetch_account_name() {
         Ok(n) => n,
@@ -78,18 +87,31 @@ fn connect(cookies: BTreeMap<String, String>) -> Result<String> {
             return Err(e.context("YouTube didn't accept the session"));
         }
     };
+    // the cookies decide which channel is active (a brand account picked in the
+    // browser); history only reaches it when calls also carry its page id
+    let list = channels().unwrap_or_default();
+    let active = match &page {
+        Some(id) => list.into_iter().find(|c| c.page_id.as_ref() == Some(id)),
+        None => list.into_iter().find(|c| c.selected),
+    };
+    let name = active.as_ref().map(|c| c.name.clone()).unwrap_or(name);
+    let page_id = page.or(active.and_then(|c| c.page_id));
     let mut s = session().lock();
     if let Some(st) = s.as_mut() {
         st.account = Some(name.clone());
+        st.page_id = page_id;
     }
     save(&s);
     Ok(name)
 }
 
+fn cookie_string(c: &BTreeMap<String, String>) -> String {
+    c.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; ")
+}
+
 fn cookie_header() -> Option<String> {
     let s = session().lock();
-    let s = s.as_ref()?;
-    Some(s.cookies.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; "))
+    Some(cookie_string(&s.as_ref()?.cookies))
 }
 
 fn sha1_hex(s: &str) -> String {
@@ -98,9 +120,7 @@ fn sha1_hex(s: &str) -> String {
 }
 
 /// The `Authorization` header youtube.com sends with its API calls.
-fn sapisid_auth() -> Option<String> {
-    let s = session().lock();
-    let c = &s.as_ref()?.cookies;
+fn sapisid_auth_for(c: &BTreeMap<String, String>) -> Option<String> {
     let ts = chrono::Utc::now().timestamp();
     let parts: Vec<String> = [("SAPISIDHASH", "SAPISID"), ("SAPISID1PHASH", "__Secure-1PAPISID"), ("SAPISID3PHASH", "__Secure-3PAPISID")]
         .iter()
@@ -113,15 +133,22 @@ fn sapisid_auth() -> Option<String> {
 }
 
 /// A call to the YouTube website's API as the signed-in user.
-pub fn web_call(endpoint: &str, mut body: Value) -> Result<Value> {
-    let cookie = cookie_header().ok_or_else(|| anyhow!("browser sign-in not connected"))?;
-    let auth = sapisid_auth().ok_or_else(|| anyhow!("browser sign-in not connected"))?;
+pub fn web_call(endpoint: &str, body: Value) -> Result<Value> {
+    let (cookies, page_id) = {
+        let s = session().lock();
+        let s = s.as_ref().ok_or_else(|| anyhow!("browser sign-in not connected"))?;
+        (s.cookies.clone(), s.page_id.clone())
+    };
+    web_call_as(&cookies, page_id.as_deref(), endpoint, body)
+}
+
+/// A website API call with the given cookies (and brand account page id).
+fn web_call_as(cookies: &BTreeMap<String, String>, page_id: Option<&str>, endpoint: &str, mut body: Value) -> Result<Value> {
+    let cookie = cookie_string(cookies);
+    let auth = sapisid_auth_for(cookies).ok_or_else(|| anyhow!("browser sign-in not connected"))?;
     let st = crate::store::settings_snapshot();
     body["context"] = json!({ "client": { "clientName": "WEB", "clientVersion": WEB_VERSION, "hl": st.language, "gl": st.region } });
-    let (status, v) = http::post_json_status(
-        &format!("https://www.youtube.com/youtubei/v1/{endpoint}?prettyPrint=false"),
-        &body,
-        &[
+    let mut headers: Vec<(&str, &str)> = vec![
             ("Cookie", &cookie),
             ("Authorization", &auth),
             ("Origin", ORIGIN),
@@ -131,8 +158,11 @@ pub fn web_call(endpoint: &str, mut body: Value) -> Result<Value> {
             ("X-Youtube-Bootstrap-Logged-In", "true"),
             ("X-Youtube-Client-Name", "1"),
             ("X-Youtube-Client-Version", WEB_VERSION),
-        ],
-    )?;
+        ];
+    if let Some(p) = page_id {
+        headers.push(("X-Goog-PageId", p));
+    }
+    let (status, v) = http::post_json_status(&format!("https://www.youtube.com/youtubei/v1/{endpoint}?prettyPrint=false"), &body, &headers)?;
     if status == 401 || status == 403 {
         return Err(anyhow!("YouTube refused the browser session (HTTP {status}). Connect it again."));
     }
@@ -140,6 +170,59 @@ pub fn web_call(endpoint: &str, mut body: Value) -> Result<Value> {
         return Err(anyhow!("HTTP {status}"));
     }
     Ok(v)
+}
+
+/// A channel of the signed-in Google account; `page_id` is None for the personal one.
+#[derive(Clone, PartialEq)]
+pub struct Channel {
+    pub name: String,
+    pub page_id: Option<String>,
+    /// the channel the cookies are currently active on
+    pub selected: bool,
+}
+
+/// During browser sign-in of an account with brand channels: (waiting for the
+/// user to switch channel in the browser, user chose to continue as is).
+static SWITCH: Mutex<(bool, bool)> = Mutex::new((false, false));
+
+/// The browser sign-in is waiting for the user to pick a channel in the browser.
+pub fn waiting_for_channel() -> bool {
+    SWITCH.lock().0
+}
+
+/// Finish the browser sign-in with the channel that's active now.
+pub fn continue_with_current_channel() {
+    SWITCH.lock().1 = true;
+}
+
+/// The channels the browser session can act as (personal + brand accounts).
+pub fn channels() -> Result<Vec<Channel>> {
+    let cookies = session().lock().as_ref().map(|s| s.cookies.clone()).ok_or_else(|| anyhow!("browser sign-in not connected"))?;
+    channels_as(&cookies)
+}
+
+fn channels_as(cookies: &BTreeMap<String, String>) -> Result<Vec<Channel>> {
+    let r = web_call_as(
+        cookies,
+        None,
+        "account/accounts_list",
+        json!({ "requestType": "ACCOUNTS_LIST_REQUEST_TYPE_CHANNEL_SWITCHER", "callCircumstance": "SWITCHING_USERS_FULL" }),
+    )?;
+    let mut items = Vec::new();
+    crate::api::json::find_all(&r, "accountItemRenderer", &mut items);
+    let mut out: Vec<Channel> = Vec::new();
+    for it in items {
+        let name = it.get("accountName").map(crate::api::json::text).unwrap_or_default();
+        let page_id = crate::api::json::find(it, "pageId").and_then(Value::as_str).map(str::to_string);
+        let selected = it.get("isSelected").and_then(Value::as_bool).unwrap_or(false);
+        if !name.is_empty() && !out.iter().any(|c| c.page_id == page_id) {
+            out.push(Channel { name, page_id, selected });
+        }
+    }
+    if out.is_empty() {
+        return Err(anyhow!("YouTube didn't list any channels"));
+    }
+    Ok(out)
 }
 
 fn fetch_account_name() -> Result<String> {
@@ -249,6 +332,39 @@ fn cdp_cookies(port: u16) -> Result<Vec<Value>> {
     }
 }
 
+/// The brand channel the browser's YouTube tab is acting as, if any.
+fn cdp_delegated_id(port: u16) -> Option<String> {
+    let v = cdp_eval(port, "(window.ytcfg && ytcfg.get('DELEGATED_SESSION_ID')) || ''").ok()?;
+    v.as_str().filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// Evaluates a JavaScript expression in the browser's YouTube tab.
+fn cdp_eval(port: u16, expr: &str) -> Result<Value> {
+    let mut resp = local_agent().get(&format!("http://127.0.0.1:{port}/json/list")).call()?;
+    let v: Value = serde_json::from_str(&resp.body_mut().read_to_string()?)?;
+    let pages: Vec<&Value> = v.as_array().into_iter().flatten().filter(|t| t.get("type").and_then(Value::as_str) == Some("page")).collect();
+    let ws = pages
+        .iter()
+        .find(|t| t.get("url").and_then(Value::as_str).is_some_and(|u| u.starts_with(ORIGIN)))
+        .or(pages.first())
+        .and_then(|t| t.get("webSocketDebuggerUrl").and_then(Value::as_str))
+        .ok_or_else(|| anyhow!("no browser tab"))?
+        .to_string();
+    let stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let (mut sock, _) = tungstenite::client(ws.as_str(), stream).map_err(|e| anyhow!("devtools: {e}"))?;
+    sock.send(tungstenite::Message::text(json!({ "id": 3, "method": "Runtime.evaluate", "params": { "expression": expr, "returnByValue": true } }).to_string()))?;
+    loop {
+        if let tungstenite::Message::Text(t) = sock.read()? {
+            let v: Value = serde_json::from_str(t.as_str())?;
+            if v.get("id").and_then(Value::as_i64) == Some(3) {
+                let _ = sock.close(None);
+                return Ok(v.pointer("/result/result/value").cloned().unwrap_or(Value::Null));
+            }
+        }
+    }
+}
+
 fn cdp_close(port: u16) {
     let Ok(mut resp) = local_agent().get(&format!("http://127.0.0.1:{port}/json/version")).call() else { return };
     let Ok(v) = serde_json::from_str::<Value>(&resp.body_mut().read_to_string().unwrap_or_default()) else { return };
@@ -295,6 +411,9 @@ pub fn browser_sign_in(cancel: Arc<AtomicBool>) -> Result<String> {
     }
     let mut child = cmd.spawn().context("couldn't start the browser")?;
     let started = Instant::now();
+    let mut last: Option<BTreeMap<String, String>> = None;
+    let mut asked = false;
+    *SWITCH.lock() = (false, false);
     let result = loop {
         std::thread::sleep(Duration::from_millis(1500));
         if cancel.load(Ordering::Relaxed) {
@@ -302,18 +421,39 @@ pub fn browser_sign_in(cancel: Arc<AtomicBool>) -> Result<String> {
         }
         if let Ok(Some(_)) = child.try_wait() {
             // the user closed the window; the browser may have handed off to an
-            // already running copy, but with our own profile that doesn't happen
-            break Err(anyhow!("The browser was closed before sign-in finished."));
+            // already running copy, but with our own profile that doesn't happen.
+            // Closed on the channel switcher: keep the channel that's active.
+            break last.take().map(|c| (c, None)).ok_or_else(|| anyhow!("The browser was closed before sign-in finished."));
         }
         if started.elapsed() > Duration::from_secs(20 * 60) {
             break Err(anyhow!("Sign-in timed out."));
         }
         let Ok(list) = cdp_cookies(port) else { continue };
         let cookies = youtube_cookies(&list);
-        if has_login(&cookies) && cookies.contains_key("LOGIN_INFO") {
-            break Ok(cookies);
+        if !(has_login(&cookies) && cookies.contains_key("LOGIN_INFO")) {
+            continue;
+        }
+        last = Some(cookies.clone());
+        if !asked {
+            // with brand channels the user switches to one in the browser (YouTube
+            // only switches through its own page), or continues as is
+            match channels_as(&cookies) {
+                Ok(l) if l.iter().any(|c| c.page_id.is_some()) => {
+                    *SWITCH.lock() = (true, false);
+                    asked = true;
+                    continue;
+                }
+                _ => break Ok((cookies, None)),
+            }
+        }
+        if let Some(id) = cdp_delegated_id(port) {
+            break Ok((cookies, Some(id)));
+        }
+        if SWITCH.lock().1 {
+            break Ok((cookies, None));
         }
     };
+    *SWITCH.lock() = (false, false);
     cdp_close(port);
     for _ in 0..20 {
         if let Ok(Some(_)) = child.try_wait() {
@@ -329,7 +469,8 @@ pub fn browser_sign_in(cancel: Arc<AtomicBool>) -> Result<String> {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    connect(result?)
+    let (cookies, page) = result?;
+    connect_as(cookies, page)
 }
 
 /// Reads a Netscape-format cookies.txt (as saved by "Get cookies.txt" style
