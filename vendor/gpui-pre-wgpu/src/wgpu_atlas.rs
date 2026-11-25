@@ -37,7 +37,16 @@ struct WgpuAtlasTextures {
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
     next_texture_generation: u64,
+    /// Stream Tube patch: textures whose last tile was removed, kept for reuse.
+    /// Video frames are images larger than an atlas page, so each one gets a
+    /// texture of its own; without this every frame created a full-size texture
+    /// and released one. Oldest first, at most `MAX_SPARE_TEXTURES`.
+    spare_textures: Vec<WgpuAtlasTexture>,
 }
+
+/// Stream Tube patch: how many freed textures `spare_textures` keeps. Two covers
+/// a video whose frame is replaced every paint, with one frame still on screen.
+const MAX_SPARE_TEXTURES: usize = 2;
 
 pub struct WgpuTextureInfo {
     pub view: wgpu::TextureView,
@@ -60,6 +69,7 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
             next_texture_generation: 0,
+            spare_textures: Vec::new(),
         })))
     }
 
@@ -95,6 +105,8 @@ impl WgpuAtlas {
         self.0.lock().clear(|textures| {
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            // Stream Tube patch: start over without the spare textures too.
+            textures.spare_textures.clear();
         });
     }
 
@@ -107,6 +119,8 @@ impl WgpuAtlas {
             textures.color_texture_format = context.color_texture_format();
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            // Stream Tube patch: spare textures belong to the lost device.
+            textures.spare_textures.clear();
         });
     }
 }
@@ -152,6 +166,12 @@ impl AtlasBackend for WgpuAtlasTextures {
                 self.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
+                // Stream Tube patch: keep the texture for the next one of its size
+                // and kind instead of releasing it. Its pending uploads are gone.
+                if self.spare_textures.len() >= MAX_SPARE_TEXTURES {
+                    self.spare_textures.remove(0);
+                }
+                self.spare_textures.push(texture);
             } else {
                 *texture_slot = Some(texture);
             }
@@ -202,22 +222,26 @@ impl WgpuAtlasTextures {
             AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => self.color_texture_format,
         };
 
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("atlas"),
-            size: wgpu::Extent3d {
-                width: size.width.0 as u32,
-                height: size.height.0 as u32,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Stream Tube patch: reuse a spare texture of exactly this size, kind and
+        // format. Its allocator is empty (every tile was removed); clearing it
+        // resets it. It gets a new generation below, like a new texture, so the
+        // renderer rebuilds its bind group.
+        let etagere_size = device_size_to_etagere(size);
+        let spare = self
+            .spare_textures
+            .iter()
+            .position(|t| {
+                t.id.kind == kind && t.format == format && t.allocator.size() == etagere_size
+            })
+            .map(|ix| self.spare_textures.remove(ix));
+        let (texture, view, allocator) = if let Some(spare) = spare {
+            let mut allocator = spare.allocator;
+            allocator.clear();
+            (spare.texture, spare.view, allocator)
+        } else {
+            let (texture, view) = self.create_texture(size, format);
+            (texture, view, BucketedAtlasAllocator::new(etagere_size))
+        };
 
         let texture_list = &mut self.storage[kind];
         let index = texture_list.free_list.pop();
@@ -230,7 +254,7 @@ impl WgpuAtlasTextures {
                 kind,
             },
             generation,
-            allocator: BucketedAtlasAllocator::new(device_size_to_etagere(size)),
+            allocator,
             format,
             texture,
             view,
@@ -254,7 +278,46 @@ impl WgpuAtlasTextures {
         }
     }
 
+    /// Stream Tube patch: texture and view creation, moved out of `push_texture`
+    /// unchanged so a spare texture can be used instead.
+    fn create_texture(
+        &self,
+        size: Size<DevicePixels>,
+        format: wgpu::TextureFormat,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("atlas"),
+            size: wgpu::Extent3d {
+                width: size.width.0 as u32,
+                height: size.height.0 as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
     fn upload_texture(&mut self, id: AtlasTextureId, bounds: Bounds<DevicePixels>, bytes: &[u8]) {
+        // Stream Tube patch: when the bytes are already in the texture's format,
+        // hand them to the queue now instead of copying them into a pending
+        // upload (`bytes` only lives for this call). `write_texture` stages its
+        // own copy and applies it before the next submit, like `flush_uploads`
+        // does. Whether a texture swizzles depends only on its format, so its
+        // uploads all take the same path and stay in order.
+        if let Some(texture) = self.storage.get(id) {
+            if !needs_swizzle(texture.format) {
+                write_tile(&self.queue, texture, bounds, bytes);
+                return;
+            }
+        }
+
         let data = self
             .storage
             .get(id)
@@ -270,33 +333,44 @@ impl WgpuAtlasTextures {
             let Some(texture) = self.storage.get(upload.id) else {
                 continue;
             };
-            let bytes_per_pixel = texture.bytes_per_pixel();
-
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: upload.bounds.origin.x.0 as u32,
-                        y: upload.bounds.origin.y.0 as u32,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &upload.data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(upload.bounds.size.width.0 as u32 * bytes_per_pixel as u32),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: upload.bounds.size.width.0 as u32,
-                    height: upload.bounds.size.height.0 as u32,
-                    depth_or_array_layers: 1,
-                },
-            );
+            write_tile(&self.queue, texture, upload.bounds, &upload.data);
         }
     }
+}
+
+/// Stream Tube patch: the `write_texture` call from `flush_uploads`, unchanged,
+/// so `upload_texture` can use it too.
+fn write_tile(
+    queue: &wgpu::Queue,
+    texture: &WgpuAtlasTexture,
+    bounds: Bounds<DevicePixels>,
+    data: &[u8],
+) {
+    let bytes_per_pixel = texture.bytes_per_pixel();
+
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture.texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: bounds.origin.x.0 as u32,
+                y: bounds.origin.y.0 as u32,
+                z: 0,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(bounds.size.width.0 as u32 * bytes_per_pixel as u32),
+            rows_per_image: None,
+        },
+        wgpu::Extent3d {
+            width: bounds.size.width.0 as u32,
+            height: bounds.size.height.0 as u32,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 #[derive(Default)]
@@ -377,6 +451,11 @@ impl WgpuAtlasTexture {
     fn is_unreferenced(&self) -> bool {
         self.live_atlas_keys == 0
     }
+}
+
+/// Stream Tube patch: whether `swizzle_upload_data` changes bytes for `format`.
+fn needs_swizzle(format: wgpu::TextureFormat) -> bool {
+    format == wgpu::TextureFormat::Rgba8Unorm
 }
 
 fn swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Vec<u8> {
@@ -545,6 +624,101 @@ mod tests {
 
         assert_eq!(second_tile.texture_id, first_tile.texture_id);
         assert_ne!(second_generation, first_generation);
+        Ok(())
+    }
+
+    // Stream Tube patch: uploads that need no swizzle go to the queue at once;
+    // the others still wait for `before_frame`.
+    #[test]
+    fn only_swizzled_uploads_are_deferred() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let size = Size {
+            width: DevicePixels(2),
+            height: DevicePixels(2),
+        };
+        let key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(1),
+            frame_index: 0,
+        });
+        for (format, pending) in [
+            (wgpu::TextureFormat::Bgra8Unorm, 0),
+            (wgpu::TextureFormat::Rgba8Unorm, 1),
+        ] {
+            let atlas = WgpuAtlas::new(device.clone(), queue.clone(), format);
+            atlas
+                .get_or_insert_with(key.clone(), &mut || {
+                    Ok(Some((size, Cow::Owned(vec![0x80; 16]))))
+                })?
+                .expect("tile should be created");
+            assert_eq!(atlas.0.lock().backend.pending_uploads.len(), pending);
+            atlas.before_frame();
+            assert!(atlas.0.lock().backend.pending_uploads.is_empty());
+        }
+        Ok(())
+    }
+
+    // Stream Tube patch: a freed texture is reused, with a new generation, for the
+    // next image of the same size, and not for one of another size.
+    #[test]
+    fn freed_texture_is_reused_for_same_size() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let frame = Size {
+            width: DevicePixels(1920),
+            height: DevicePixels(1080),
+        };
+        let other = Size {
+            width: DevicePixels(1280),
+            height: DevicePixels(1100),
+        };
+        let make_key = |image_id| {
+            AtlasKey::Image(RenderImageParams {
+                image_id: ImageId(image_id),
+                frame_index: 0,
+            })
+        };
+        let insert = |image_id, size: Size<DevicePixels>| {
+            atlas
+                .get_or_insert_with(make_key(image_id), &mut || {
+                    Ok(Some((
+                        size,
+                        Cow::Owned(vec![0; size.width.0 as usize * size.height.0 as usize * 4]),
+                    )))
+                })
+                .expect("allocation should succeed")
+                .expect("callback returns Some")
+        };
+        let texture_of = |tile: &AtlasTile| {
+            let lock = atlas.0.lock();
+            let texture = lock
+                .backend
+                .storage
+                .get(tile.texture_id)
+                .expect("tile's texture exists");
+            (texture.texture.clone(), texture.generation)
+        };
+
+        let tile_a = insert(1, frame);
+        let (texture_a, generation_a) = texture_of(&tile_a);
+        atlas.remove(&make_key(1));
+        assert_eq!(atlas.0.lock().backend.spare_textures.len(), 1);
+
+        let tile_b = insert(2, other);
+        assert_ne!(texture_of(&tile_b).0, texture_a);
+
+        let tile_c = insert(3, frame);
+        let (texture_c, generation_c) = texture_of(&tile_c);
+        assert_eq!(texture_c, texture_a);
+        assert_ne!(generation_c, generation_a);
+        assert_eq!(tile_c.bounds.origin, Point::default());
+        assert!(atlas.0.lock().backend.spare_textures.is_empty());
+
+        for image_id in 4..10 {
+            insert(image_id, frame);
+            atlas.remove(&make_key(image_id));
+        }
+        assert!(atlas.0.lock().backend.spare_textures.len() <= MAX_SPARE_TEXTURES);
+        atlas.before_frame();
         Ok(())
     }
 
