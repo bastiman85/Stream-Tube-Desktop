@@ -42,5 +42,8 @@ embed-resource = "3"
 
 # GPUI's Windows text backend with one fix: right-to-left text (Arabic, Hebrew)
 # was drawn mirrored. See vendor/gpui-pre-windows/PATCHES.md.
+# GPUI's wgpu renderer (Linux) without an extra copy of every uploaded image.
+# See vendor/gpui-pre-wgpu/PATCHES.md.
 [patch.crates-io]
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
