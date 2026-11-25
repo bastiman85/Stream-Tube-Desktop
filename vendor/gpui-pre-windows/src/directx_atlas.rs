@@ -2,8 +2,9 @@ use etagere::BucketedAtlasAllocator;
 use parking_lot::Mutex;
 use windows::Win32::Graphics::{
     Direct3D11::{
-        D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-        ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
+        D3D11_BIND_FLAG, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView,
+        ID3D11Texture2D,
     },
     Dxgi::Common::*,
 };
@@ -21,7 +22,16 @@ struct DirectXAtlasTextures {
     monochrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     polychrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     subpixel_textures: AtlasTextureList<DirectXAtlasTexture>,
+    /// Stream Tube patch: textures whose last tile was removed, kept for reuse.
+    /// Video frames are images larger than an atlas page, so each one gets a
+    /// texture of its own; without this every frame created and released a
+    /// full-size texture and its view. Oldest first, at most `MAX_SPARE_TEXTURES`.
+    spare_textures: Vec<DirectXAtlasTexture>,
 }
+
+/// Stream Tube patch: how many freed textures `spare_textures` keeps. Two covers
+/// a video whose frame is replaced every paint, with one frame still on screen.
+const MAX_SPARE_TEXTURES: usize = 2;
 
 struct DirectXAtlasTexture {
     id: AtlasTextureId,
@@ -40,6 +50,7 @@ impl DirectXAtlas {
             monochrome_textures: Default::default(),
             polychrome_textures: Default::default(),
             subpixel_textures: Default::default(),
+            spare_textures: Vec::new(),
         })))
     }
 
@@ -68,6 +79,8 @@ impl DirectXAtlas {
             textures.monochrome_textures = AtlasTextureList::default();
             textures.polychrome_textures = AtlasTextureList::default();
             textures.subpixel_textures = AtlasTextureList::default();
+            // Stream Tube patch: spare textures belong to the lost device.
+            textures.spare_textures.clear();
         });
     }
 }
@@ -123,6 +136,12 @@ impl AtlasBackend for DirectXAtlasTextures {
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
                 textures.free_list.push(texture.id.index as usize);
+                // Stream Tube patch: keep the texture for the next one of its size
+                // and kind instead of releasing it.
+                if self.spare_textures.len() >= MAX_SPARE_TEXTURES {
+                    self.spare_textures.remove(0);
+                }
+                self.spare_textures.push(texture);
             } else {
                 *texture_slot = Some(texture);
             }
@@ -192,6 +211,61 @@ impl DirectXAtlasTextures {
                 bytes_per_pixel = 4;
             }
         }
+        // Stream Tube patch: reuse a spare texture of exactly this size and kind.
+        // Its allocator is empty (every tile was removed); clearing it resets it.
+        let etagere_size = device_size_to_etagere(size);
+        let spare = self
+            .spare_textures
+            .iter()
+            .position(|t| t.id.kind == kind && t.allocator.size() == etagere_size)
+            .map(|ix| self.spare_textures.remove(ix));
+        let (texture, view, allocator) = if let Some(spare) = spare {
+            let mut allocator = spare.allocator;
+            allocator.clear();
+            (spare.texture, spare.view, allocator)
+        } else {
+            let (texture, view) = self.create_texture(size, pixel_format, bind_flag)?;
+            (
+                texture,
+                view,
+                etagere::BucketedAtlasAllocator::new(etagere_size),
+            )
+        };
+
+        let texture_list = match kind {
+            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+            AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
+        };
+        let index = texture_list.free_list.pop();
+        let atlas_texture = DirectXAtlasTexture {
+            id: AtlasTextureId {
+                index: index.unwrap_or(texture_list.textures.len()) as u32,
+                kind,
+            },
+            bytes_per_pixel,
+            allocator,
+            texture,
+            view,
+            live_atlas_keys: 0,
+        };
+        if let Some(ix) = index {
+            texture_list.textures[ix] = Some(atlas_texture);
+            texture_list.textures.get_mut(ix).unwrap().as_mut()
+        } else {
+            texture_list.textures.push(Some(atlas_texture));
+            texture_list.textures.last_mut().unwrap().as_mut()
+        }
+    }
+
+    /// Stream Tube patch: texture and view creation, moved out of `push_texture`
+    /// unchanged so a spare texture can be used instead.
+    fn create_texture(
+        &self,
+        size: Size<DevicePixels>,
+        pixel_format: DXGI_FORMAT,
+        bind_flag: D3D11_BIND_FLAG,
+    ) -> Option<(ID3D11Texture2D, [Option<ID3D11ShaderResourceView>; 1])> {
         let texture_desc = D3D11_TEXTURE2D_DESC {
             Width: size.width.0 as u32,
             Height: size.height.0 as u32,
@@ -216,13 +290,6 @@ impl DirectXAtlasTextures {
                 .ok()?;
         }
         let texture = texture.unwrap();
-
-        let texture_list = match kind {
-            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
-            AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
-        };
-        let index = texture_list.free_list.pop();
         let view = unsafe {
             let mut view = None;
             self.device
@@ -230,24 +297,7 @@ impl DirectXAtlasTextures {
                 .ok()?;
             [view]
         };
-        let atlas_texture = DirectXAtlasTexture {
-            id: AtlasTextureId {
-                index: index.unwrap_or(texture_list.textures.len()) as u32,
-                kind,
-            },
-            bytes_per_pixel,
-            allocator: etagere::BucketedAtlasAllocator::new(device_size_to_etagere(size)),
-            texture,
-            view,
-            live_atlas_keys: 0,
-        };
-        if let Some(ix) = index {
-            texture_list.textures[ix] = Some(atlas_texture);
-            texture_list.textures.get_mut(ix).unwrap().as_mut()
-        } else {
-            texture_list.textures.push(Some(atlas_texture));
-            texture_list.textures.last_mut().unwrap().as_mut()
-        }
+        Some((texture, view))
     }
 
     fn texture(&self, id: AtlasTextureId) -> Option<&DirectXAtlasTexture> {
@@ -416,5 +466,60 @@ mod tests {
 
         let tile_b = insert_tile(&atlas, big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
+    }
+
+    fn raw_texture(atlas: &DirectXAtlas, tile: &AtlasTile) -> *mut std::ffi::c_void {
+        use windows::core::Interface;
+        atlas
+            .0
+            .lock()
+            .backend
+            .texture(tile.texture_id)
+            .expect("tile's texture exists")
+            .texture
+            .as_raw()
+    }
+
+    // Stream Tube patch: a freed texture is reused for the next image of the same
+    // size, and not for one of another size.
+    #[test]
+    fn test_freed_texture_is_reused_for_same_size() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+
+        let frame = Size {
+            width: DevicePixels(1920),
+            height: DevicePixels(1080),
+        };
+        let other = Size {
+            width: DevicePixels(1280),
+            height: DevicePixels(1100),
+        };
+
+        let tile_a = insert_tile(&atlas, make_image_key(1), frame);
+        let texture_a = raw_texture(&atlas, &tile_a);
+        atlas.remove(&make_image_key(1));
+        assert_eq!(atlas.0.lock().backend.spare_textures.len(), 1);
+
+        let tile_b = insert_tile(&atlas, make_image_key(2), other);
+        assert_ne!(raw_texture(&atlas, &tile_b), texture_a);
+
+        let tile_c = insert_tile(&atlas, make_image_key(3), frame);
+        assert_eq!(raw_texture(&atlas, &tile_c), texture_a);
+        assert_eq!(tile_c.bounds.origin, Point::default());
+        assert!(atlas.0.lock().backend.spare_textures.is_empty());
+
+        for key in [2, 3] {
+            atlas.remove(&make_image_key(key));
+        }
+        let tile_d = insert_tile(&atlas, make_image_key(4), frame);
+        assert_eq!(raw_texture(&atlas, &tile_d), texture_a);
+        atlas.remove(&make_image_key(4));
+        for key in 5..10 {
+            insert_tile(&atlas, make_image_key(key), frame);
+            atlas.remove(&make_image_key(key));
+        }
+        assert!(atlas.0.lock().backend.spare_textures.len() <= MAX_SPARE_TEXTURES);
     }
 }
