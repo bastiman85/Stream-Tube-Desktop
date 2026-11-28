@@ -231,6 +231,7 @@ pub(crate) fn parse_tile(t: &Value) -> Option<VideoItem> {
         published_text: published,
         is_live,
         playlist_id: show_playlist,
+        is_members_only: crate::api::json::is_members_only(t),
         ..Default::default()
     })
 }
@@ -294,6 +295,7 @@ fn parse_video_renderer(r: &Value) -> Option<VideoItem> {
         is_short,
         is_upcoming,
         playlist_id: None,
+        is_members_only: crate::api::json::is_members_only(r),
     })
 }
 
@@ -461,6 +463,7 @@ fn parse_lockup(l: &Value) -> Option<Item> {
                 is_live,
                 is_upcoming,
                 is_short,
+                is_members_only: crate::api::json::is_members_only(l),
                 ..Default::default()
             }))
         }
@@ -1781,6 +1784,28 @@ mod tests {
         let links = description_links(&runs, text);
         assert_eq!(links.len(), 1);
         assert_eq!(&text[links[0].range.clone()], "Video");
+    }
+
+    #[test]
+    fn members_only_badge_in_any_language() {
+        // web lockup (channel Videos tab / playlists), label in the account's language
+        let lockup = json!({ "lockupViewModel": {
+            "contentId": "abc", "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+            "metadata": { "lockupMetadataViewModel": { "title": { "content": "T" },
+                "metadata": { "contentMetadataViewModel": { "metadataRows": [
+                    { "badges": [{ "badgeViewModel": { "badgeText": "Endast medlemmar", "badgeStyle": "BADGE_MEMBERS_ONLY", "iconName": "SPONSORSHIP_STAR" } }] }
+                ] } } } } } });
+        // TV tile (signed-in feeds, playlists)
+        let tile = json!({ "tileRenderer": {
+            "contentId": "def", "contentType": "TILE_CONTENT_TYPE_VIDEO",
+            "metadata": { "tileMetadataRenderer": { "title": { "simpleText": "T" }, "lines": [
+                { "lineRenderer": { "items": [{ "lineItemRenderer": { "badge": { "metadataBadgeRenderer": {
+                    "style": "BADGE_STYLE_TYPE_MEMBERS_ONLY", "label": "Endast medlemmar", "icon": { "iconType": "SPONSORSHIP_STAR" } } } } }] } }
+            ] } } } });
+        let plain = json!({ "videoRenderer": { "videoId": "ghi", "title": { "simpleText": "T" } } });
+        let items = collect_items(&json!({ "contents": [lockup, tile, plain] })).items;
+        let flags: Vec<_> = items.iter().filter_map(|i| i.as_video()).map(|v| (v.id.as_str(), v.is_members_only)).collect();
+        assert_eq!(flags, [("abc", true), ("def", true), ("ghi", false)]);
     }
 
     #[test]

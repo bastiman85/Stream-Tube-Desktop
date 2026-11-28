@@ -35,6 +35,8 @@ pub struct Pal {
     pub chip_active_bg: Hsla,
     pub chip_active_fg: Hsla,
     pub overlay: Hsla,
+    /// youtube.com's green for the "Members only" label
+    pub members: Hsla,
 }
 
 impl Global for Pal {}
@@ -58,6 +60,7 @@ impl Pal {
                 chip_active_bg: rgb(0xf1f1f1).into(),
                 chip_active_fg: rgb(0x0f0f0f).into(),
                 overlay: hsla(0., 0., 0., 0.8),
+                members: rgb(0x2ba640).into(),
             }
         } else {
             Self {
@@ -76,6 +79,7 @@ impl Pal {
                 chip_active_bg: rgb(0x0f0f0f).into(),
                 chip_active_fg: rgb(0xffffff).into(),
                 overlay: hsla(0., 0., 0., 0.8),
+                members: rgb(0x2ba640).into(),
             }
         }
     }

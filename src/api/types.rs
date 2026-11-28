@@ -22,6 +22,9 @@ pub struct VideoItem {
     /// Set when the card stands for a show (podcast, series): the playlist of its
     /// episodes, which is what opening the card should show.
     pub playlist_id: Option<String>,
+    /// Only channel members can watch it (youtube.com's green "Members only" label).
+    #[serde(default)]
+    pub is_members_only: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

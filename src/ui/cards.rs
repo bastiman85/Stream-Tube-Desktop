@@ -91,6 +91,21 @@ pub fn meta_line(v: &VideoItem) -> String {
     parts.join(", ")
 }
 
+/// youtube.com's green "Members only" line under a video's details.
+fn members_only_label(v: &VideoItem, p: Pal) -> Option<Div> {
+    v.is_members_only.then(|| {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(p.members)
+            .child(icon("circle-star").size_3p5().text_color(p.members))
+            .child(t("Members only"))
+    })
+}
+
 fn badge(v: &VideoItem, cx: &App) -> Option<AnyElement> {
     let _ = cx;
     let (text, bg): (String, Hsla) = if v.is_live {
@@ -506,7 +521,8 @@ pub fn video_card(v: &VideoItem, width: Pixels, show_channel: bool, cx: &mut App
                                     .child(gpui_kit::base::SelectableText::new(SharedString::from(format!("vcn-{}", v.id)), v.channel_name.clone())),
                             )
                         })
-                        .child(div().text_sm().text_color(p.text2).truncate().child(meta)),
+                        .child(div().text_sm().text_color(p.text2).truncate().child(meta))
+                        .children(members_only_label(v, p)),
                 )
                 .child(more_button(SharedString::from(format!("vm-{}", v.id)), v, cx)),
         )
@@ -601,6 +617,7 @@ pub fn video_row(v: &VideoItem, thumb_w: Pixels, cx: &mut App) -> AnyElement {
                         .child(more_button(SharedString::from(format!("vrm-{}", v.id)), v, cx)),
                 )
                 .child(div().text_xs().text_color(p.text2).child(meta))
+                .children(members_only_label(v, p))
                 .when(!v.channel_name.is_empty(), |d| {
                     let cr = channel_route.clone();
                     d.child(
@@ -706,7 +723,8 @@ pub fn compact_row(v: &VideoItem, thumb_size: Size<Pixels>, active: bool, on_cli
                         })
                         .child(gpui_kit::base::SelectableText::new(SharedString::from(format!("crn-{}", v.id)), v.channel_name.clone()))
                 })
-                .child(div().text_xs().text_color(p.text2).truncate().child(meta_line(v))),
+                .child(div().text_xs().text_color(p.text2).truncate().child(meta_line(v)))
+                .children(members_only_label(v, p)),
         )
         .child(more_button_with(SharedString::from(format!("crm-{}", v.id)), v, extra, cx))
         .into_any_element()

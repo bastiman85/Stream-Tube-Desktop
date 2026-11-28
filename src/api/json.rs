@@ -104,6 +104,20 @@ pub fn is_ad(v: &Value) -> bool {
     }
 }
 
+/// Whether a video renderer carries the "Members only" badge (web lockups use
+/// `badgeStyle: BADGE_MEMBERS_ONLY`, TV tiles and old renderers
+/// `style: BADGE_STYLE_TYPE_MEMBERS_ONLY`; the label text is in the account's language).
+pub fn is_members_only(v: &Value) -> bool {
+    match v {
+        Value::Object(m) => m.iter().any(|(k, c)| {
+            ((k == "style" || k == "badgeStyle") && matches!(c.as_str(), Some("BADGE_MEMBERS_ONLY" | "BADGE_STYLE_TYPE_MEMBERS_ONLY")))
+                || is_members_only(c)
+        }),
+        Value::Array(a) => a.iter().any(is_members_only),
+        _ => false,
+    }
+}
+
 /// Largest thumbnail url in a {thumbnails:[...]} or {sources:[...]} object.
 pub fn best_thumb(v: &Value) -> Option<String> {
     let arr = v
