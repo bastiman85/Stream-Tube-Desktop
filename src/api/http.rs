@@ -11,17 +11,68 @@ pub const BROWSER_UA: &str =
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(crate) struct NetworkAgent(Mutex<Option<CachedAgent>>);
+pub(crate) struct NetworkAgent(Mutex<Vec<CachedAgent>>);
 
 struct CachedAgent {
-    ipv4_only: bool,
+    family: IpFamily,
     proxy: String,
     agent: ureq::Agent,
 }
 
+/// Set once YouTube's bot check was passed by switching address family (see
+/// `switch_family`): new requests then use the other family for the rest of the session.
+static SWITCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The address family new requests use: the "Use IPv4 only" setting, turned
+/// around while `switch_family` is in effect.
+pub fn family(settings: &crate::store::Settings) -> IpFamily {
+    match (settings.ipv4_only, SWITCHED.load(std::sync::atomic::Ordering::Relaxed)) {
+        (false, false) => IpFamily::Any,
+        (false, true) | (true, false) => IpFamily::Ipv4Only,
+        (true, true) => IpFamily::Ipv6Only,
+    }
+}
+
+/// YouTube's bot check is per address, and on some networks it flags the IPv6
+/// address and not the IPv4 one, or the other way round. Turns the family new
+/// requests use around (call again to undo); false when a proxy decides the route.
+pub fn switch_family() -> bool {
+    if crate::store::proxy_setting().is_some() {
+        return false;
+    }
+    SWITCHED.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// The yt-dlp flag for the family new requests use.
+pub fn ytdlp_family_arg() -> Option<&'static str> {
+    match family(&crate::store::settings_snapshot()) {
+        IpFamily::Any => None,
+        IpFamily::Ipv4Only => Some("--force-ipv4"),
+        IpFamily::Ipv6Only => Some("--force-ipv6"),
+    }
+}
+
+/// googlevideo URLs carry the address they were handed out to (`ip=` or
+/// `/ip/<addr>/`) and only play from it: the family to fetch such a URL with.
+pub fn family_of_url(url: &str) -> Option<IpFamily> {
+    let ip = url
+        .split(['?', '&'])
+        .find_map(|p| p.strip_prefix("ip="))
+        .or_else(|| url.split_once("/ip/").map(|(_, rest)| rest))?;
+    let ip = ip.split(['/', '&', '?']).next()?;
+    if ip.contains(':') || ip.to_ascii_lowercase().contains("%3a") {
+        Some(IpFamily::Ipv6Only)
+    } else if !ip.is_empty() && ip.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        Some(IpFamily::Ipv4Only)
+    } else {
+        None
+    }
+}
+
 impl NetworkAgent {
     pub(crate) const fn new() -> Self {
-        Self(Mutex::new(None))
+        Self(Mutex::new(Vec::new()))
     }
 
     pub(crate) fn get(
@@ -29,18 +80,21 @@ impl NetworkAgent {
         settings: &crate::store::Settings,
         configure: impl FnOnce(ConfigBuilder<AgentScope>) -> ConfigBuilder<AgentScope>,
     ) -> ureq::Agent {
+        self.get_with(settings, family(settings), configure)
+    }
+
+    /// An agent for the given address family (one is kept per family).
+    pub(crate) fn get_with(
+        &self,
+        settings: &crate::store::Settings,
+        family: IpFamily,
+        configure: impl FnOnce(ConfigBuilder<AgentScope>) -> ConfigBuilder<AgentScope>,
+    ) -> ureq::Agent {
         let mut cached = self.0.lock();
-        if let Some(current) = cached.as_ref().filter(|current| {
-            current.ipv4_only == settings.ipv4_only && current.proxy == settings.proxy
-        }) {
+        cached.retain(|c| c.proxy == settings.proxy);
+        if let Some(current) = cached.iter().find(|c| c.family == family) {
             return current.agent.clone();
         }
-
-        let family = if settings.ipv4_only {
-            IpFamily::Ipv4Only
-        } else {
-            IpFamily::Any
-        };
         let mut builder = configure(ureq::Agent::config_builder()).ip_family(family);
         if !settings.proxy.trim().is_empty() {
             if let Ok(proxy) = ureq::Proxy::new(&settings.proxy) {
@@ -48,8 +102,8 @@ impl NetworkAgent {
             }
         }
         let agent = builder.build().new_agent();
-        *cached = Some(CachedAgent {
-            ipv4_only: settings.ipv4_only,
+        cached.push(CachedAgent {
+            family,
             proxy: settings.proxy.clone(),
             agent: agent.clone(),
         });
@@ -90,6 +144,17 @@ mod tests {
         settings.ipv4_only = true;
         let restored = cache.get(&settings, |builder| builder);
         assert_eq!(restored.config().ip_family(), IpFamily::Ipv4Only);
+    }
+
+    #[test]
+    fn reads_the_address_family_a_stream_url_is_bound_to() {
+        use super::family_of_url;
+        assert_eq!(family_of_url("https://r1.googlevideo.com/videoplayback?expire=1&ip=90.231.8.221&id=x"), Some(IpFamily::Ipv4Only));
+        assert_eq!(family_of_url("https://r1.googlevideo.com/videoplayback?ip=2a02%3A1234%3A%3A1&id=x"), Some(IpFamily::Ipv6Only));
+        assert_eq!(family_of_url("https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1/ip/2a02:1234::1/id/x/file/index.m3u8"), Some(IpFamily::Ipv6Only));
+        assert_eq!(family_of_url("https://manifest.googlevideo.com/api/manifest/hls_playlist/ip/90.231.8.221/itag/96/index.m3u8"), Some(IpFamily::Ipv4Only));
+        assert_eq!(family_of_url("https://www.youtube.com/api/timedtext?v=x&lang=en"), None);
+        assert_eq!(family_of_url("https://example.com/?skip=1"), None);
     }
 
     #[test]

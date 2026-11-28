@@ -393,9 +393,9 @@ fn ytdlp_run(bin: &str, dir: &std::path::Path, url: &str, fmt: &str, s: &store::
         if let Some(ff) = ffmpeg_path().filter(|f| f != "ffmpeg") {
             cmd.arg("--ffmpeg-location").arg(ff);
         }
-        if s.ipv4_only {
-            // YouTube's bot check is triggered far more often on IPv6
-            cmd.arg("--force-ipv4");
+        // "Use IPv4 only", or the other family after a bot check passed by switching
+        if let Some(flag) = crate::api::http::ytdlp_family_arg() {
+            cmd.arg(flag);
         }
         // --print makes yt-dlp quiet, so progress is asked for explicitly in a fixed format.
         // Fragments and chunks download in parallel, which is much faster than one stream.

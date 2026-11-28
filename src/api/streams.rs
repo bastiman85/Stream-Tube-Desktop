@@ -57,6 +57,50 @@ pub fn prefetch_on_hover(video_id: &str) {
 }
 
 fn resolve(video_id: &str) -> Result<StreamInfo> {
+    let res = resolve_once(video_id);
+    match res {
+        Err(e) if bot_check(&format!("{e:#}")) => with_other_family(video_id, e),
+        other => other,
+    }
+}
+
+/// "Sign in to confirm you're not a bot": YouTube flagged this network's address.
+fn bot_check(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("not a bot")
+}
+
+/// YouTube's bot check is per address: on some networks it refuses a video over
+/// IPv6 and plays it over IPv4, or the other way round. Tries the other family
+/// once; when that plays, the rest of the session stays on it.
+fn with_other_family(video_id: &str, first: anyhow::Error) -> Result<StreamInfo> {
+    // one switch at a time: a second resolution refused the same way waits, then
+    // finds the family already switched and tries it as is
+    static SWITCHING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let before = http::family(&crate::store::settings_snapshot());
+    let _guard = SWITCHING.lock();
+    if http::family(&crate::store::settings_snapshot()) != before {
+        return resolve_once(video_id).map_err(|_| first);
+    }
+    if !http::switch_family() {
+        return Err(first);
+    }
+    let after = http::family(&crate::store::settings_snapshot());
+    match resolve_once(video_id) {
+        Ok(info) => {
+            eprintln!("[streams] bot check on {before:?}; {video_id} plays on {after:?}, which new requests now use");
+            Ok(info)
+        }
+        Err(e) => {
+            http::switch_family();
+            if crate::perf::on() {
+                eprintln!("[streams] {after:?} refused {video_id} too: {e:#}");
+            }
+            Err(first)
+        }
+    }
+}
+
+fn resolve_once(video_id: &str) -> Result<StreamInfo> {
     let res = resolve_anonymous(video_id);
     let res = match res {
         // the TV client answers live streams without an HLS manifest, and live
@@ -1077,8 +1121,8 @@ fn ytdlp_streams_with(video_id: &str, cookies: Option<&std::path::Path>) -> Resu
     if let Some(p) = crate::store::proxy_setting() {
         cmd.arg("--proxy").arg(p);
     }
-    if crate::store::settings_snapshot().ipv4_only {
-        cmd.arg("--force-ipv4");
+    if let Some(flag) = http::ytdlp_family_arg() {
+        cmd.arg(flag);
     }
     cmd.args(crate::api::jsc::ytdlp_runtime_args());
     cmd.env("PYTHONIOENCODING", "utf-8");
@@ -1348,6 +1392,33 @@ pub fn mpv_source(video: Option<&StreamFormat>, audio: Option<&StreamFormat>, du
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// STREAMTUBE_TEST_VIDEO=<id refused over one family> STREAMTUBE_TEST_IPV4_ONLY=0|1
+    #[test]
+    #[ignore]
+    fn live_bot_check_switches_family() {
+        let id = std::env::var("STREAMTUBE_TEST_VIDEO").expect("STREAMTUBE_TEST_VIDEO");
+        let v4 = std::env::var("STREAMTUBE_TEST_IPV4_ONLY").is_ok_and(|v| v == "1");
+        crate::store::update_settings(|s| {
+            s.ipv4_only = v4;
+            s.stream_backend = "auto".into();
+        });
+        let start = http::family(&crate::store::settings_snapshot());
+        let first = resolve_once(&id);
+        eprintln!("{start:?} alone: {}", match &first { Ok(_) => "ok".to_string(), Err(e) => format!("{e:#}").lines().next().unwrap_or("").to_string() });
+        let info = resolve(&id).expect("resolves with the family switch");
+        let now = http::family(&crate::store::settings_snapshot());
+        eprintln!("resolved via {} on {now:?}", info.source);
+        let url = info.hls_url.clone().or_else(|| info.video.first().map(|f| f.url.clone())).expect("a stream url");
+        let fam = http::family_of_url(&url);
+        eprintln!("stream url bound to {fam:?}");
+        let r = crate::player::proxy::agent(&url).get(&url).header("User-Agent", http::BROWSER_UA).header("Range", "bytes=0-1023").call().expect("fetch");
+        eprintln!("fetch status {}", r.status());
+        assert!(r.status().as_u16() < 400);
+        if first.is_err() {
+            assert_ne!(start, now, "the family stays switched after it worked");
+        }
+    }
+
     #[test]
     #[ignore]
     fn live_streams() {

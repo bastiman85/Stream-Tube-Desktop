@@ -214,7 +214,7 @@ impl Download {
         if !self.can_fetch() || !url.starts_with("https://") {
             return None;
         }
-        let mut req = proxy::agent().get(url).header("User-Agent", crate::api::http::BROWSER_UA);
+        let mut req = proxy::agent(url).get(url).header("User-Agent", crate::api::http::BROWSER_UA);
         if prefix {
             req = req.header("Range", &format!("bytes=0-{}", limit - 1));
         }

@@ -392,7 +392,7 @@ fn serve_playlist(conn: &mut TcpStream, p: &Proxy, url: &str, max_height: u32, a
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(300 * attempt));
         }
-        if let Ok(mut r) = agent().get(url).header("User-Agent", crate::api::http::BROWSER_UA).call() {
+        if let Ok(mut r) = agent(url).get(url).header("User-Agent", crate::api::http::BROWSER_UA).call() {
             if r.status().as_u16() < 400 {
                 if let Ok(body) = r.body_mut().with_config().limit(16 << 20).read_to_string() {
                     let body: Arc<str> = body.into();
@@ -541,7 +541,7 @@ fn open_pass(url: &str, range: Option<(u64, Option<u64>)>) -> Option<ureq::http:
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(300 * attempt));
         }
-        let mut req = agent().get(url).header("User-Agent", crate::api::http::BROWSER_UA);
+        let mut req = agent(url).get(url).header("User-Agent", crate::api::http::BROWSER_UA);
         let rg;
         if let Some((a, b)) = range {
             rg = match b {
@@ -558,9 +558,15 @@ fn open_pass(url: &str, range: Option<(u64, Option<u64>)>) -> Option<ureq::http:
     None
 }
 
-pub(super) fn agent() -> ureq::Agent {
+/// The agent to fetch `url` with: over the address family a googlevideo URL was
+/// handed out to (it only plays from that address), else the current one.
+pub(crate) fn agent(url: &str) -> ureq::Agent {
     static AGENT: crate::api::http::NetworkAgent = crate::api::http::NetworkAgent::new();
-    AGENT.get(&crate::store::settings_snapshot(), |builder| {
+    let settings = crate::store::settings_snapshot();
+    let family = crate::api::http::family_of_url(url)
+        .filter(|_| crate::store::proxy_setting().is_none())
+        .unwrap_or_else(|| crate::api::http::family(&settings));
+    AGENT.get_with(&settings, family, |builder| {
         builder
             .http_status_as_error(false)
             .timeout_connect(Some(std::time::Duration::from_secs(10)))
@@ -571,13 +577,13 @@ pub(super) fn agent() -> ureq::Agent {
 
 /// Learns the total size with a 1-byte request when the API didn't provide it.
 fn probe_len(url: &str) -> Option<u64> {
-    let r = agent().get(url).header("User-Agent", crate::api::http::BROWSER_UA).header("Range", "bytes=0-0").call().ok()?;
+    let r = agent(url).get(url).header("User-Agent", crate::api::http::BROWSER_UA).header("Range", "bytes=0-0").call().ok()?;
     let cr = r.headers().get("content-range")?.to_str().ok()?.to_string();
     cr.rsplit('/').next()?.trim().parse().ok()
 }
 
 fn fetch_range(url: &str, start: u64, end: u64) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
-    agent()
+    agent(url)
         .get(url)
         .header("User-Agent", crate::api::http::BROWSER_UA)
         .header("Range", &format!("bytes={start}-{end}"))
@@ -969,7 +975,7 @@ fn fetch_bytes(url: &str) -> Option<Body> {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(300 * attempt));
         }
-        let Ok(mut r) = agent().get(url).header("User-Agent", crate::api::http::BROWSER_UA).call() else { continue };
+        let Ok(mut r) = agent(url).get(url).header("User-Agent", crate::api::http::BROWSER_UA).call() else { continue };
         if r.status().as_u16() >= 400 {
             continue;
         }
